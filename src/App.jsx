@@ -1,8 +1,8 @@
 import React, { useState, useMemo } from "react";
 import {
   AlertTriangle, Activity, Thermometer, Droplet, Heart, Wind,
-  Plus, ChevronRight, ArrowLeft, CheckCircle2, Clock, Ruler,
-  Stethoscope, Baby, ClipboardCheck, ArrowDownCircle, Gauge,
+  Plus, ChevronRight, ChevronDown, ArrowLeft, CheckCircle2, Clock,
+  Stethoscope, ClipboardCheck, ArrowDownCircle, Gauge,
 } from "lucide-react";
 
 /*
@@ -10,132 +10,178 @@ import {
   ---------------------------------------------------
   Sits at the door of the Inpatient Therapeutic Programme. Children arrive
   ALREADY referred from OTP, so the job is a sieve:
-    1. Catch genuinely critical children immediately (emergency gate, no vitals).
-    2. Re-assess everyone else -> confirm ITP need, or step back down to OTP.
+    Phase 1 — eyeball EMERGENCY GATE (no equipment): any one sign -> Emergency.
+    Phase 2 — VITALS & ASSESSMENT: a tiered rule engine.
 
-  Disposition is an OVERRIDE HIERARCHY (not a weighted score), per WHO ETAT:
-    - Any one emergency sign  -> EMERGENCY
-    - else any WHO inpatient trigger (danger sign / oedema +++ / failed appetite
-      test / priority sign / red vital) -> CONFIRMED ITP
-    - else (clinically well, appetite intact) -> STEP-DOWN CANDIDATE (pending doctor)
+  Disposition is a TIERED OVERRIDE, not a weighted score. Every finding carries
+  a severity (transition < acute < emergency). We collect ALL findings and route
+  the child to their single HIGHEST-severity finding. No findings -> step down
+  to OTP. The tool advises; the clinician decides.
 
-  All thresholds below are STANDARD WHO PLACEHOLDERS and must be validated
-  against Taimaka's own protocols and the Nigerian national CMAM/IMCI guidelines.
+  ⚠️  EVERY clinical number below is a PLACEHOLDER (standard WHO/IMCI-ish) and
+  must be replaced with Taimaka's real CMAM / IMCI / national-guideline values.
+  They all live in the CLINICAL CONFIG block immediately below so they can be
+  edited in one place. Keep units in sync with thresholds. The acute-vs-transition
+  weighting is a deliberate scaffold, NOT validated clinical logic.
+
   No database — everything is in memory for the demo.
 */
 
-// ---------- clinical thresholds (placeholders) ----------
-function rrThreshold(ageMonths) {
-  // IMCI fast-breathing cut-offs
-  if (ageMonths != null && ageMonths < 12) return 50;
-  return 40;
-}
+// ============================================================================
+//  CLINICAL CONFIG  — ALL PLACEHOLDER VALUES. Edit here.
+// ============================================================================
 
-// returns "green" | "amber" | "red" | null
-function band(metric, value, ageMonths) {
-  if (value == null || value === "" || isNaN(value)) return null;
-  const v = Number(value);
-  switch (metric) {
-    case "bloodSugar": // mmol/L
-      if (v < 3) return "red";
-      if (v < 4) return "amber";
-      return "green";
-    case "temp": // °C
-      if (v < 35 || v >= 39) return "red";
-      if (v < 36.5 || v > 37.5) return "amber";
-      return "green";
-    case "rr": {
-      const t = rrThreshold(ageMonths);
-      if (v >= t + 20 || v < 20) return "red";
-      if (v >= t) return "amber";
-      return "green";
-    }
-    case "hr":
-      if (v > 180 || v < 80) return "red";
-      if (v > 160) return "amber";
-      return "green";
-    case "spo2":
-      if (v < 90) return "red";
-      if (v < 94) return "amber";
-      return "green";
-    case "muac": // mm — context only, NOT an ITP trigger on its own
-      if (v < 115) return "red";
-      if (v < 125) return "amber";
-      return "green";
-    default:
+// Severity ranking. Higher number = more severe = wins the routing tie-break.
+const TIER_RANK = { transition: 1, acute: 2, emergency: 3 };
+
+// Map a finding's tier to a vitals-cell colour band.
+const TIER_BAND = { none: "green", transition: "amber", acute: "red", emergency: "red" };
+
+// IMCI fast-breathing cut-off (breaths/min) by age.
+const rrFastThreshold = (ageMonths) =>
+  (ageMonths != null && ageMonths !== "" && Number(ageMonths) < 12 ? 50 : 40);
+
+// helper for the per-vital evaluators below
+const f = (tier, finding) => ({ tier, finding });
+
+// Phase 1 — EMERGENCY GATE. Any one "Yes" => Emergency (skip vitals).
+const EMERGENCY_GATE = [
+  {
+    key: "airwayBreathing",
+    title: "Airway or breathing problem",
+    finding: "Airway / breathing compromise",
+    look: [
+      "Is the child breathing at all?",
+      "Is the airway obstructed?",
+      "Blue lips or tongue (central cyanosis)?",
+      "Severe respiratory distress?",
+    ],
+  },
+  {
+    key: "shock",
+    title: "Circulation impairment (shock)",
+    finding: "Circulatory shock",
+    look: [
+      "Cold hands?",
+      "Capillary refill longer than 3 seconds?",
+      "Weak and rapid pulse?",
+    ],
+  },
+  {
+    key: "comaSeizure",
+    title: "Seizure / convulsion or coma",
+    finding: "Coma or active seizure",
+    look: [
+      "Not alert on AVPU?",
+      "No response to voice or to pain?",
+      "Convulsing right now?",
+    ],
+  },
+  {
+    key: "severeDehydration",
+    title: "Severe dehydration",
+    finding: "Severe dehydration",
+    look: [
+      "Diarrhoea, vomiting, or poor fluid intake (malaise / fever)?",
+      "PLUS any one of:",
+      "• Lethargic or unconscious",
+      "• Sunken eyes",
+      "• Skin pinch goes back very slowly (> 2s)",
+    ],
+  },
+];
+
+// Phase 2 — VITALS. Each evaluator returns {tier, finding} or null (= normal).
+// Order here is the on-screen order.
+const VITALS = [
+  {
+    key: "hr", label: "Heart rate", unit: "bpm", icon: Heart,
+    tier(v) {
+      if (v < 80) return f("emergency", "Bradycardia (very low heart rate)");
+      if (v > 180) return f("emergency", "Very high heart rate");
+      if (v > 160) return f("acute", "High heart rate");
       return null;
-  }
-}
-
-const EMERGENCY_FIELDS = [
-  ["airwayBreathing", "Airway / breathing compromise", "Obstructed or absent breathing, severe distress, or central cyanosis"],
-  ["shock", "Signs of shock", "Cold hands + capillary refill > 3s + weak, fast pulse"],
-  ["coma", "Coma / reduced consciousness", "Unconscious or not responding normally"],
-  ["convulsing", "Convulsing now", "Active seizure on arrival"],
-  ["severeDehydration", "Severe dehydration (with diarrhoea)", "Lethargy, sunken eyes, very slow skin pinch"],
+    },
+  },
+  {
+    key: "rr", label: "Resp. rate", unit: "/min", icon: Wind,
+    tier(v, ageMonths) {
+      const t = rrFastThreshold(ageMonths);
+      if (v < 20) return f("emergency", "Very low respiratory rate");
+      if (v >= t + 20) return f("emergency", "Severe fast breathing");
+      if (v >= t) return f("acute", "Fast breathing");
+      return null;
+    },
+  },
+  {
+    key: "spo2", label: "SpO₂", unit: "%", icon: Gauge, hint: "if oximeter available",
+    tier(v) {
+      if (v < 90) return f("emergency", "Severe hypoxaemia");
+      if (v < 94) return f("acute", "Hypoxaemia");
+      if (v < 96) return f("transition", "Borderline oxygen saturation");
+      return null;
+    },
+  },
+  {
+    key: "temp", label: "Temp", unit: "°C", icon: Thermometer,
+    tier(v) {
+      if (v < 35.0) return f("emergency", "Severe hypothermia");
+      if (v < 36.0) return f("acute", "Hypothermia");
+      if (v < 36.5) return f("transition", "Low temperature");
+      if (v <= 37.5) return null;
+      if (v < 39.0) return f("acute", "Fever");
+      return f("emergency", "High fever");
+    },
+  },
+  {
+    key: "pcv", label: "PCV", unit: "%", icon: Activity, hint: "packed cell volume — anaemia",
+    tier(v) {
+      if (v < 12) return f("emergency", "Severe anaemia");
+      if (v < 18) return f("acute", "Anaemia");
+      if (v < 24) return f("transition", "Mild anaemia");
+      return null;
+    },
+  },
+  {
+    key: "bloodSugar", label: "Blood sugar", unit: "mmol/L", icon: Droplet, hint: "random",
+    tier(v) {
+      if (v < 2.2) return f("emergency", "Severe hypoglycaemia");
+      if (v < 3.0) return f("acute", "Hypoglycaemia (low blood sugar)");
+      if (v < 3.5) return f("transition", "Borderline low blood sugar");
+      return null;
+    },
+  },
 ];
 
-const DANGER_FIELDS = [
-  ["cannotDrink", "Not able to drink or breastfeed"],
-  ["vomitsEverything", "Vomits everything"],
-  ["convulsionsHistory", "Convulsions (this illness)"],
-  ["lethargic", "Lethargic or unconscious"],
-];
-
-const PRIORITY_FIELDS = [
-  ["smallInfant", "Small infant (under 6 months)"],
-  ["severePallor", "Severe palmar pallor"],
-  ["respiratoryDistress", "Respiratory distress"],
-  ["restlessIrritable", "Restless / irritable"],
-];
-
-// ---------- disposition engine ----------
-function disposition(p) {
-  // 1. Emergency override
-  const eReasons = EMERGENCY_FIELDS
-    .filter(([k]) => p.emergency[k])
-    .map(([, label]) => label);
-  if (eReasons.length) {
-    return { level: "emergency", reasons: eReasons, ward: "Resuscitation / emergency bay — call clinician now" };
-  }
-
-  // 2. Not yet fully assessed
-  if (!p.assessed) {
-    return { level: "pending", reasons: ["Awaiting full assessment"], ward: "—" };
-  }
-
-  // 3. Inpatient (ITP) triggers
-  const reasons = [];
-  DANGER_FIELDS.forEach(([k, label]) => { if (p.danger[k]) reasons.push("Danger sign: " + label.toLowerCase()); });
-  PRIORITY_FIELDS.forEach(([k, label]) => { if (p.priority[k]) reasons.push("Priority sign: " + label.toLowerCase()); });
-  if (p.oedema === "+++") reasons.push("Severe bilateral oedema (+++)");
-  if (p.appetite === "fail") reasons.push("Failed appetite test");
-
-  const v = p.vitals;
-  if (band("bloodSugar", v.bloodSugar) === "red") reasons.push("Hypoglycaemia (low blood sugar)");
-  if (band("temp", v.temp) === "red") reasons.push(Number(v.temp) < 35 ? "Hypothermia" : "High fever");
-  if (band("rr", v.rr, p.ageMonths) === "red") reasons.push("Severe respiratory rate");
-  if (band("hr", v.hr) === "red") reasons.push("Abnormal heart rate");
-  if (band("spo2", v.spo2) === "red") reasons.push("Hypoxaemia (low oxygen)");
-
-  if (reasons.length) {
-    return { level: "itp", reasons, ward: "Admit — inpatient stabilisation (ITP)" };
-  }
-
-  // 4. Step-down candidate
-  return {
-    level: "stepdown",
-    reasons: ["No inpatient criteria met", "Appetite intact, clinically well & alert"],
-    ward: "Step down to OTP — pending doctor sign-off",
-  };
-}
-
-const LEVEL = {
-  emergency: { label: "Emergency", bar: "bg-red-600", chip: "bg-red-600 text-white", soft: "bg-red-50 text-red-700 border-red-200", ring: "ring-red-200", order: 0 },
-  pending:   { label: "Awaiting assessment", bar: "bg-slate-400", chip: "bg-slate-600 text-white", soft: "bg-slate-50 text-slate-600 border-slate-200", ring: "ring-slate-200", order: 1 },
-  itp:       { label: "Confirmed ITP", bar: "bg-amber-500", chip: "bg-amber-500 text-white", soft: "bg-amber-50 text-amber-800 border-amber-200", ring: "ring-amber-200", order: 2 },
-  stepdown:  { label: "Step-down candidate", bar: "bg-emerald-600", chip: "bg-emerald-600 text-white", soft: "bg-emerald-50 text-emerald-700 border-emerald-200", ring: "ring-emerald-200", order: 3 },
+// Phase 2 — other (non-vital) findings.
+const APPETITE_FAIL = f("acute", "Failed appetite test");
+const OEDEMA_TIER = {
+  "+++": f("acute", "Bilateral oedema (+++)"),
+  "++": f("acute", "Bilateral oedema (++)"),
+  "+": f("transition", "Bilateral oedema (+)"),
+  none: null,
 };
+
+// Dispositions: level -> label + ward + colours + board sort order.
+const LEVEL = {
+  emergency:  { label: "ITP · Emergency",     ward: "ICU / resuscitation — call clinician now", order: 0, bar: "bg-red-600",     chip: "bg-red-600 text-white",    soft: "bg-red-50 text-red-700 border-red-200",          ring: "ring-red-200",     border: "border-red-400",     icon: AlertTriangle },
+  pending:    { label: "Awaiting assessment", ward: "—",                                         order: 1, bar: "bg-slate-400",   chip: "bg-slate-600 text-white",  soft: "bg-slate-50 text-slate-600 border-slate-200",    ring: "ring-slate-200",   border: "border-slate-300",   icon: Clock },
+  acute:      { label: "ITP · Acute",         ward: "Admit — acute / Phase 1 stabilisation",     order: 2, bar: "bg-orange-500",  chip: "bg-orange-500 text-white", soft: "bg-orange-50 text-orange-800 border-orange-200", ring: "ring-orange-200",  border: "border-orange-400",  icon: Activity },
+  transition: { label: "ITP · Transition",    ward: "Admit — transition phase",                  order: 3, bar: "bg-amber-500",   chip: "bg-amber-500 text-white",  soft: "bg-amber-50 text-amber-800 border-amber-200",    ring: "ring-amber-200",   border: "border-amber-400",   icon: Activity },
+  stepdown:   { label: "Step-down to OTP",    ward: "Step down to OTP — pending doctor sign-off", order: 4, bar: "bg-emerald-600", chip: "bg-emerald-600 text-white",soft: "bg-emerald-50 text-emerald-700 border-emerald-200",ring: "ring-emerald-200", border: "border-emerald-400", icon: ArrowDownCircle },
+};
+
+// Tier badge colours for the findings list.
+const TIER_BADGE = {
+  emergency:  "bg-red-50 text-red-700 border-red-200",
+  acute:      "bg-orange-50 text-orange-800 border-orange-200",
+  transition: "bg-amber-50 text-amber-800 border-amber-200",
+};
+const TIER_LABEL = { emergency: "Emergency", acute: "Acute", transition: "Transition" };
+
+// ============================================================================
+//  END CLINICAL CONFIG
+// ============================================================================
 
 const bandClasses = {
   green: "bg-emerald-50 text-emerald-700 border-emerald-200",
@@ -143,6 +189,59 @@ const bandClasses = {
   red: "bg-red-50 text-red-700 border-red-200",
   null: "bg-slate-50 text-slate-400 border-slate-200",
 };
+
+// Evaluate one vital. Returns {tier, finding} for an abnormal value,
+// {tier:"none"} for a normal value, or null when there's no value.
+function evalVital(vital, rawValue, ageMonths) {
+  if (rawValue == null || rawValue === "" || isNaN(rawValue)) return null;
+  const res = vital.tier(Number(rawValue), ageMonths);
+  return res || { tier: "none" };
+}
+
+// Colour band for a vitals cell.
+function vitalBand(vital, rawValue, ageMonths) {
+  const r = evalVital(vital, rawValue, ageMonths);
+  return r ? TIER_BAND[r.tier] : null;
+}
+
+// ---------- disposition engine ----------
+function disposition(p) {
+  // Phase 1 — emergency gate override.
+  const gateReasons = EMERGENCY_GATE
+    .filter((g) => p.gate && p.gate[g.key] === true)
+    .map((g) => ({ tier: "emergency", label: g.finding }));
+  if (gateReasons.length) {
+    return { level: "emergency", findings: gateReasons, ward: LEVEL.emergency.ward };
+  }
+
+  // Interim — gate clear but vitals not entered yet.
+  if (!p.assessed) {
+    return { level: "pending", findings: [{ tier: "pending", label: "Awaiting full assessment" }], ward: LEVEL.pending.ward };
+  }
+
+  // Phase 2 — collect every finding with its tier.
+  const findings = [];
+  VITALS.forEach((vital) => {
+    const r = evalVital(vital, p.vitals?.[vital.key], p.ageMonths);
+    if (r && r.tier !== "none") findings.push({ tier: r.tier, label: r.finding });
+  });
+  if (p.appetite === "fail") findings.push({ ...APPETITE_FAIL, label: APPETITE_FAIL.finding });
+  const oed = OEDEMA_TIER[p.oedema];
+  if (oed) findings.push({ tier: oed.tier, label: oed.finding });
+
+  if (!findings.length) {
+    return {
+      level: "stepdown",
+      findings: [{ tier: "stepdown", label: "No inpatient criteria met — clinically well, appetite intact" }],
+      ward: LEVEL.stepdown.ward,
+    };
+  }
+
+  // Route to the single highest-severity finding.
+  findings.sort((a, b) => TIER_RANK[b.tier] - TIER_RANK[a.tier]);
+  const level = findings[0].tier;
+  return { level, findings, ward: LEVEL[level].ward };
+}
 
 // ---------- seed data ----------
 const now = Date.now();
@@ -152,23 +251,37 @@ const nid = () => `p${++_id}`;
 
 const seed = [
   {
+    // Emergency via gate — convulsing on arrival, no vitals needed.
     id: nid(), name: "Aisha B.", ageMonths: 14, sex: "F", arrival: mins(6),
-    emergency: { airwayBreathing: false, shock: false, coma: false, convulsing: true, severeDehydration: false },
-    danger: {}, priority: {}, oedema: "none", appetite: null, vitals: {}, assessed: false,
+    gate: { airwayBreathing: false, shock: false, comaSeizure: true, severeDehydration: false },
+    oedema: "none", appetite: null, vitals: {}, assessed: false,
   },
   {
+    // Acute — multiple acute findings (hypothermia, hypoxaemia, anaemia, failed appetite).
     id: nid(), name: "Musa A.", ageMonths: 9, sex: "M", arrival: mins(22),
-    emergency: {}, danger: { lethargic: true }, priority: {}, oedema: "+", appetite: "fail",
-    vitals: { bloodSugar: 2.4, temp: 35.8, hr: 168, rr: 56, spo2: 92, muac: 102, weight: 6.1 }, assessed: true,
+    gate: { airwayBreathing: false, shock: false, comaSeizure: false, severeDehydration: false },
+    oedema: "++", appetite: "fail",
+    vitals: { hr: 168, rr: 44, spo2: 92, temp: 35.8, pcv: 16, bloodSugar: 4.0 }, assessed: true,
   },
   {
-    id: nid(), name: "Yusuf I.", ageMonths: 18, sex: "M", arrival: mins(15),
-    emergency: {}, danger: {}, priority: {}, oedema: "none", appetite: null, vitals: {}, assessed: false,
-  },
-  {
+    // Transition — only transition-tier findings (mild anaemia, borderline SpO₂, oedema +).
     id: nid(), name: "Fatima S.", ageMonths: 30, sex: "F", arrival: mins(40),
-    emergency: {}, danger: {}, priority: {}, oedema: "none", appetite: "pass",
-    vitals: { bloodSugar: 5.1, temp: 37.0, hr: 120, rr: 30, spo2: 98, muac: 113, weight: 10.2 }, assessed: true,
+    gate: { airwayBreathing: false, shock: false, comaSeizure: false, severeDehydration: false },
+    oedema: "+", appetite: "pass",
+    vitals: { hr: 120, rr: 30, spo2: 95, temp: 37.0, pcv: 22, bloodSugar: 4.4 }, assessed: true,
+  },
+  {
+    // Step-down — everything normal, appetite intact.
+    id: nid(), name: "Hadiza K.", ageMonths: 36, sex: "F", arrival: mins(52),
+    gate: { airwayBreathing: false, shock: false, comaSeizure: false, severeDehydration: false },
+    oedema: "none", appetite: "pass",
+    vitals: { hr: 110, rr: 28, spo2: 98, temp: 37.0, pcv: 31, bloodSugar: 5.1 }, assessed: true,
+  },
+  {
+    // Pending — gate clear, vitals not yet entered.
+    id: nid(), name: "Yusuf I.", ageMonths: 18, sex: "M", arrival: mins(15),
+    gate: { airwayBreathing: false, shock: false, comaSeizure: false, severeDehydration: false },
+    oedema: "none", appetite: null, vitals: {}, assessed: false,
   },
 ];
 
@@ -179,37 +292,13 @@ function waitLabel(arrival) {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-function Toggle({ active, onClick, title, sub, danger }) {
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full text-left rounded-xl border px-4 py-3 transition ${
-        active
-          ? danger
-            ? "border-red-500 bg-red-50 ring-2 ring-red-200"
-            : "border-amber-500 bg-amber-50 ring-2 ring-amber-200"
-          : "border-slate-200 bg-white hover:border-slate-300"
-      }`}
-    >
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className={`text-sm font-medium ${active ? (danger ? "text-red-800" : "text-amber-900") : "text-slate-800"}`}>{title}</div>
-          {sub && <div className="mt-0.5 text-xs text-slate-500">{sub}</div>}
-        </div>
-        <div className={`h-5 w-5 shrink-0 rounded-md border-2 ${active ? (danger ? "border-red-500 bg-red-500" : "border-amber-500 bg-amber-500") : "border-slate-300"}`}>
-          {active && <CheckCircle2 className="h-full w-full text-white" strokeWidth={2.5} />}
-        </div>
-      </div>
-    </button>
-  );
-}
-
-function VitalInput({ icon: Icon, label, unit, metric, value, onChange, ageMonths, hint }) {
-  const b = band(metric, value, ageMonths);
+function VitalInput({ vital, value, onChange, ageMonths }) {
+  const Icon = vital.icon;
+  const b = vitalBand(vital, value, ageMonths);
   return (
     <div className={`rounded-xl border p-3 transition ${b ? bandClasses[b] : bandClasses.null}`}>
       <div className="flex items-center gap-1.5 text-xs font-medium opacity-80">
-        <Icon className="h-3.5 w-3.5" /> {label}
+        <Icon className="h-3.5 w-3.5" /> {vital.label}
       </div>
       <div className="mt-1 flex items-baseline gap-1">
         <input
@@ -220,9 +309,9 @@ function VitalInput({ icon: Icon, label, unit, metric, value, onChange, ageMonth
           placeholder="—"
           className="w-full bg-transparent text-2xl font-semibold tabular-nums outline-none placeholder:text-slate-300"
         />
-        <span className="text-xs font-medium opacity-70">{unit}</span>
+        <span className="text-xs font-medium opacity-70">{vital.unit}</span>
       </div>
-      {hint && <div className="mt-0.5 text-[10px] leading-tight opacity-60">{hint}</div>}
+      {vital.hint && <div className="mt-0.5 text-[10px] leading-tight opacity-60">{vital.hint}</div>}
     </div>
   );
 }
@@ -240,7 +329,7 @@ export default function App() {
       if (o !== 0) return o;
       return new Date(a.arrival) - new Date(b.arrival); // longest waiting first
     });
-    const buckets = { emergency: [], pending: [], itp: [], stepdown: [] };
+    const buckets = { emergency: [], pending: [], acute: [], transition: [], stepdown: [] };
     withDisp.forEach((p) => buckets[p.disp.level].push(p));
     return buckets;
   }, [patients]);
@@ -248,14 +337,15 @@ export default function App() {
   const counts = {
     emergency: grouped.emergency.length,
     pending: grouped.pending.length,
-    itp: grouped.itp.length,
+    acute: grouped.acute.length,
+    transition: grouped.transition.length,
     stepdown: grouped.stepdown.length,
   };
 
   function startArrival() {
     setDraft({
       id: nid(), name: "", ageMonths: "", sex: "", arrival: new Date(),
-      emergency: {}, danger: {}, priority: {}, oedema: "none", appetite: null, vitals: {}, assessed: false,
+      gate: {}, oedema: "none", appetite: null, vitals: {}, assessed: false,
     });
     setView("arrival");
   }
@@ -321,20 +411,21 @@ export default function App() {
 
 // ---------- Board ----------
 function Board({ grouped, counts, onOpen, onNew }) {
-  const total = counts.emergency + counts.pending + counts.itp + counts.stepdown;
+  const total = counts.emergency + counts.pending + counts.acute + counts.transition + counts.stepdown;
   return (
     <div className="px-4 pt-4">
       {/* summary strip */}
-      <div className="mb-4 grid grid-cols-4 gap-2">
+      <div className="mb-4 grid grid-cols-5 gap-1.5">
         {[
           ["emergency", counts.emergency],
           ["pending", counts.pending],
-          ["itp", counts.itp],
+          ["acute", counts.acute],
+          ["transition", counts.transition],
           ["stepdown", counts.stepdown],
         ].map(([lvl, n]) => (
-          <div key={lvl} className={`rounded-xl border px-2 py-2 text-center ${LEVEL[lvl].soft}`}>
+          <div key={lvl} className={`rounded-xl border px-1 py-2 text-center ${LEVEL[lvl].soft}`}>
             <div className="text-xl font-bold tabular-nums">{n}</div>
-            <div className="text-[10px] font-medium leading-tight opacity-80">{LEVEL[lvl].label}</div>
+            <div className="text-[9px] font-medium leading-tight opacity-80">{LEVEL[lvl].label}</div>
           </div>
         ))}
       </div>
@@ -349,7 +440,8 @@ function Board({ grouped, counts, onOpen, onNew }) {
 
       <Section title="Emergency — act now" items={grouped.emergency} onOpen={onOpen} />
       <Section title="Awaiting assessment" items={grouped.pending} onOpen={onOpen} />
-      <Section title="Confirmed ITP — admit" items={grouped.itp} onOpen={onOpen} />
+      <Section title="ITP · Acute — admit" items={grouped.acute} onOpen={onOpen} />
+      <Section title="ITP · Transition — admit" items={grouped.transition} onOpen={onOpen} />
       <Section title="Step-down candidates" items={grouped.stepdown} onOpen={onOpen} />
 
       {/* floating new-arrival */}
@@ -404,11 +496,11 @@ function PatientCard({ p, onOpen }) {
           <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${lvl.chip}`}>{lvl.label}</span>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {p.disp.reasons.slice(0, 2).map((r, i) => (
-            <span key={i} className={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${lvl.soft}`}>{r}</span>
+          {p.disp.findings.slice(0, 2).map((r, i) => (
+            <span key={i} className={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${lvl.soft}`}>{r.label}</span>
           ))}
-          {p.disp.reasons.length > 2 && (
-            <span className="text-[10px] text-slate-400">+{p.disp.reasons.length - 2}</span>
+          {p.disp.findings.length > 2 && (
+            <span className="text-[10px] text-slate-400">+{p.disp.findings.length - 2}</span>
           )}
         </div>
         <div className="mt-2 flex items-center gap-1 text-[11px] font-medium text-slate-600">
@@ -462,27 +554,69 @@ function ArrivalForm({ draft, setDraft, onBack, onNext }) {
 }
 
 // ---------- Emergency gate ----------
-function EmergencyGate({ draft, setDraft, onBack, onEmergency, onContinue }) {
-  const any = EMERGENCY_FIELDS.some(([k]) => draft.emergency[k]);
-  const toggle = (k) => setDraft({ ...draft, emergency: { ...draft.emergency, [k]: !draft.emergency[k] } });
+function GateCategory({ cat, value, onSet }) {
+  const [open, setOpen] = useState(false);
+  const yes = value === true;
+  const no = value === false;
   return (
-    <FlowShell step={2} onBack={onBack} title="Emergency signs" subtitle="15-second check — no vitals needed">
+    <div className={`rounded-xl border transition ${yes ? "border-red-500 bg-red-50 ring-2 ring-red-200" : "border-slate-200 bg-white"}`}>
+      <div className="px-4 pt-3">
+        <div className={`text-sm font-medium ${yes ? "text-red-800" : "text-slate-800"}`}>{cat.title}</div>
+        <div className="mt-0.5 text-xs text-slate-500">Can you see signs of this?</div>
+      </div>
+      <div className="grid grid-cols-2 gap-2 px-4 pb-3 pt-2">
+        <button onClick={() => onSet(true)}
+          className={`rounded-lg border py-2 text-sm font-semibold transition ${yes ? "border-red-500 bg-red-600 text-white" : "border-slate-200 text-slate-600 hover:border-red-300"}`}>
+          Yes
+        </button>
+        <button onClick={() => onSet(false)}
+          className={`rounded-lg border py-2 text-sm font-semibold transition ${no ? "border-emerald-500 bg-emerald-600 text-white" : "border-slate-200 text-slate-600 hover:border-emerald-300"}`}>
+          No
+        </button>
+      </div>
+      <button onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between border-t border-slate-100 px-4 py-2 text-[11px] font-medium text-slate-500">
+        <span>What to look for</span>
+        <ChevronDown className={`h-4 w-4 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <ul className="space-y-1 px-4 pb-3 text-xs text-slate-600">
+          {cat.look.map((l, i) => (
+            <li key={i} className={l.startsWith("•") || l.startsWith("PLUS") ? "" : "before:mr-1.5 before:text-slate-300 before:content-['–']"}>{l}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function EmergencyGate({ draft, setDraft, onBack, onEmergency, onContinue }) {
+  const anyYes = EMERGENCY_GATE.some((g) => draft.gate[g.key] === true);
+  const allAnswered = EMERGENCY_GATE.every((g) => draft.gate[g.key] === true || draft.gate[g.key] === false);
+  const set = (k, val) => setDraft({ ...draft, gate: { ...draft.gate, [k]: val } });
+  return (
+    <FlowShell step={2} onBack={onBack} title="Emergency signs" subtitle="Eyeball check — no equipment needed">
       <div className="mb-4 flex items-start gap-2 rounded-xl bg-red-50 px-3 py-2.5 text-xs text-red-700">
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
         <span>If <strong>any one</strong> sign is present, the child goes straight to emergency — skip the rest.</span>
       </div>
-      <div className="space-y-2">
-        {EMERGENCY_FIELDS.map(([k, title, sub]) => (
-          <Toggle key={k} danger active={!!draft.emergency[k]} onClick={() => toggle(k)} title={title} sub={sub} />
+      <div className="space-y-2.5">
+        {EMERGENCY_GATE.map((cat) => (
+          <GateCategory key={cat.key} cat={cat} value={draft.gate[cat.key]} onSet={(v) => set(cat.key, v)} />
         ))}
       </div>
-      {any ? (
+      <div className="mt-4 flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2.5 text-[11px] text-slate-500">
+        <Activity className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>Severe anaemia, hypothermia and hypoglycaemia <strong>can't be eyeballed</strong> — they're detected automatically from the vitals on the next screen.</span>
+      </div>
+      {anyYes ? (
         <PrimaryBtn danger onClick={onEmergency}>
           <AlertTriangle className="h-4 w-4" /> Log & send to emergency now
         </PrimaryBtn>
       ) : (
-        <PrimaryBtn onClick={onContinue}>No emergency signs — continue assessment <ChevronRight className="h-4 w-4" /></PrimaryBtn>
+        <PrimaryBtn disabled={!allAnswered} onClick={onContinue}>No emergency signs — continue assessment <ChevronRight className="h-4 w-4" /></PrimaryBtn>
       )}
+      {!anyYes && !allAnswered && <p className="mt-2 text-center text-[11px] text-slate-400">Answer all four to continue.</p>}
     </FlowShell>
   );
 }
@@ -491,44 +625,23 @@ function EmergencyGate({ draft, setDraft, onBack, onEmergency, onContinue }) {
 function Assessment({ draft, setDraft, onBack, onFinish }) {
   const set = (patch) => setDraft({ ...draft, ...patch });
   const setVital = (k, v) => set({ vitals: { ...draft.vitals, [k]: v } });
-  const toggleDanger = (k) => set({ danger: { ...draft.danger, [k]: !draft.danger[k] } });
-  const togglePriority = (k) => set({ priority: { ...draft.priority, [k]: !draft.priority[k] } });
   const ok = draft.appetite != null;
 
   return (
-    <FlowShell step={3} onBack={onBack} title="Full assessment" subtitle={`${draft.name || "Patient"} · ${draft.ageMonths}mo`}>
-      <Group title="IMCI danger signs">
-        <div className="space-y-2">
-          {DANGER_FIELDS.map(([k, label]) => (
-            <Toggle key={k} active={!!draft.danger[k]} onClick={() => toggleDanger(k)} title={label} />
+    <FlowShell step={3} onBack={onBack} title="Vitals & assessment" subtitle={`${draft.name || "Patient"} · ${draft.ageMonths}mo`}>
+      <Group title="Vitals">
+        <div className="grid grid-cols-2 gap-2">
+          {VITALS.map((vital) => (
+            <VitalInput
+              key={vital.key}
+              vital={vital}
+              value={draft.vitals[vital.key]}
+              onChange={(v) => setVital(vital.key, v)}
+              ageMonths={draft.ageMonths}
+            />
           ))}
         </div>
-      </Group>
-
-      <Group title="Priority signs">
-        <div className="space-y-2">
-          {PRIORITY_FIELDS.map(([k, label]) => (
-            <Toggle key={k} active={!!draft.priority[k]} onClick={() => togglePriority(k)} title={label} />
-          ))}
-        </div>
-      </Group>
-
-      <Group title="Bilateral pitting oedema">
-        <div className="grid grid-cols-4 gap-2">
-          {[["none", "None"], ["+", "+"], ["++", "++"], ["+++", "+++"]].map(([v, lab]) => {
-            const active = draft.oedema === v;
-            const red = active && v === "+++";
-            return (
-              <button key={v} onClick={() => set({ oedema: v })}
-                className={`rounded-xl border py-3 text-sm font-semibold transition ${
-                  active ? (red ? "border-red-500 bg-red-50 text-red-700" : "border-teal-600 bg-teal-50 text-teal-800") : "border-slate-200 text-slate-500"
-                }`}>
-                {lab}
-              </button>
-            );
-          })}
-        </div>
-        <p className="mt-1.5 text-[11px] text-slate-400">+++ (face & body) is an automatic inpatient trigger.</p>
+        <p className="mt-1.5 text-[11px] text-slate-400">Cells colour live as you type. PCV detects anaemia; temp and blood sugar detect hypothermia and hypoglycaemia.</p>
       </Group>
 
       <Group title="Appetite test (RUTF)">
@@ -538,22 +651,33 @@ function Assessment({ draft, setDraft, onBack, onFinish }) {
             Passed
           </button>
           <button onClick={() => set({ appetite: "fail" })}
-            className={`rounded-xl border py-3.5 text-sm font-semibold transition ${draft.appetite === "fail" ? "border-red-500 bg-red-50 text-red-700" : "border-slate-200 text-slate-500"}`}>
+            className={`rounded-xl border py-3.5 text-sm font-semibold transition ${draft.appetite === "fail" ? "border-orange-500 bg-orange-50 text-orange-700" : "border-slate-200 text-slate-500"}`}>
             Failed
           </button>
         </div>
-        <p className="mt-1.5 text-[11px] text-slate-400">A failed appetite test = inpatient care. This is the key sieve question.</p>
+        <p className="mt-1.5 text-[11px] text-slate-400">A failed appetite test is an acute finding. This is the key sieve question.</p>
       </Group>
 
-      <Group title="Vitals & measurements">
-        <div className="grid grid-cols-2 gap-2">
-          <VitalInput icon={Droplet} label="Blood sugar" unit="mmol/L" metric="bloodSugar" value={draft.vitals.bloodSugar} onChange={(v) => setVital("bloodSugar", v)} />
-          <VitalInput icon={Thermometer} label="Temp" unit="°C" metric="temp" value={draft.vitals.temp} onChange={(v) => setVital("temp", v)} />
-          <VitalInput icon={Heart} label="Heart rate" unit="bpm" metric="hr" value={draft.vitals.hr} onChange={(v) => setVital("hr", v)} />
-          <VitalInput icon={Wind} label="Resp. rate" unit="/min" metric="rr" value={draft.vitals.rr} onChange={(v) => setVital("rr", v)} ageMonths={draft.ageMonths} />
-          <VitalInput icon={Gauge} label="SpO₂" unit="%" metric="spo2" value={draft.vitals.spo2} onChange={(v) => setVital("spo2", v)} hint="if oximeter available" />
-          <VitalInput icon={Ruler} label="MUAC" unit="mm" metric="muac" value={draft.vitals.muac} onChange={(v) => setVital("muac", v)} hint="context, not a trigger alone" />
+      <Group title="Bilateral pitting oedema">
+        <div className="grid grid-cols-4 gap-2">
+          {[["none", "None"], ["+", "+"], ["++", "++"], ["+++", "+++"]].map(([v, lab]) => {
+            const active = draft.oedema === v;
+            const acute = active && (v === "++" || v === "+++");
+            const trans = active && v === "+";
+            return (
+              <button key={v} onClick={() => set({ oedema: v })}
+                className={`rounded-xl border py-3 text-sm font-semibold transition ${
+                  acute ? "border-orange-500 bg-orange-50 text-orange-700"
+                    : trans ? "border-amber-500 bg-amber-50 text-amber-700"
+                    : active ? "border-teal-600 bg-teal-50 text-teal-800"
+                    : "border-slate-200 text-slate-500"
+                }`}>
+                {lab}
+              </button>
+            );
+          })}
         </div>
+        <p className="mt-1.5 text-[11px] text-slate-400">++ / +++ are acute findings; + is a transition finding.</p>
       </Group>
 
       <PrimaryBtn disabled={!ok} onClick={onFinish}>
@@ -568,17 +692,13 @@ function Assessment({ draft, setDraft, onBack, onFinish }) {
 function Result({ draft, onBack }) {
   const disp = disposition(draft);
   const lvl = LEVEL[disp.level];
-  const icon = { emergency: AlertTriangle, itp: ArrowDownCircle, stepdown: ArrowDownCircle, pending: Clock }[disp.level];
-  const Icon = disp.level === "stepdown" ? ArrowDownCircle : icon;
-  const v = draft.vitals;
-  const vitalRows = [
-    ["Blood sugar", v.bloodSugar, "mmol/L", band("bloodSugar", v.bloodSugar)],
-    ["Temperature", v.temp, "°C", band("temp", v.temp)],
-    ["Heart rate", v.hr, "bpm", band("hr", v.hr)],
-    ["Resp. rate", v.rr, "/min", band("rr", v.rr, draft.ageMonths)],
-    ["SpO₂", v.spo2, "%", band("spo2", v.spo2)],
-    ["MUAC", v.muac, "mm", band("muac", v.muac)],
-  ].filter((r) => r[1] != null && r[1] !== "");
+  const Icon = lvl.icon;
+  const routed = disp.level !== "stepdown" && disp.level !== "pending";
+
+  const v = draft.vitals || {};
+  const vitalRows = VITALS
+    .map((vital) => ({ vital, value: v[vital.key], band: vitalBand(vital, v[vital.key], draft.ageMonths) }))
+    .filter((r) => r.value != null && r.value !== "");
 
   return (
     <div className="px-4 pt-4">
@@ -587,7 +707,7 @@ function Result({ draft, onBack }) {
       </button>
 
       {/* disposition banner */}
-      <div className={`rounded-2xl border-2 p-5 ${lvl.soft.replace("50", "50")} ${disp.level === "emergency" ? "border-red-400" : disp.level === "itp" ? "border-amber-400" : disp.level === "stepdown" ? "border-emerald-400" : "border-slate-300"}`}>
+      <div className={`rounded-2xl border-2 p-5 ${lvl.soft} ${lvl.border}`}>
         <div className="flex items-center gap-2">
           <Icon className="h-6 w-6" />
           <span className="text-lg font-bold">{lvl.label}</span>
@@ -602,24 +722,32 @@ function Result({ draft, onBack }) {
           <div className="text-xs text-slate-400">{draft.ageMonths}mo · {draft.sex || "—"} · waiting {waitLabel(draft.arrival)}</div>
         </div>
 
-        <h3 className="mt-4 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Why this disposition</h3>
+        <h3 className="mt-4 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+          <span>Findings</span>
+          {routed && <span className="font-medium normal-case tracking-normal text-slate-400">routed to the highest-severity finding</span>}
+        </h3>
         <ul className="mt-2 space-y-1.5">
-          {disp.reasons.map((r, i) => (
-            <li key={i} className="flex items-start gap-2 text-sm text-slate-700">
-              <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${lvl.bar}`} />
-              {r}
-            </li>
-          ))}
+          {disp.findings.map((r, i) => {
+            const isTop = routed && i === 0;
+            return (
+              <li key={i} className="flex items-start gap-2 text-sm text-slate-700">
+                <span className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${TIER_BADGE[r.tier] || "bg-slate-50 text-slate-500 border-slate-200"}`}>
+                  {TIER_LABEL[r.tier] || "—"}
+                </span>
+                <span className={isTop ? "font-medium" : ""}>{r.label}{isTop && <span className="ml-1 text-[11px] font-normal text-slate-400">(routes disposition)</span>}</span>
+              </li>
+            );
+          })}
         </ul>
 
         {vitalRows.length > 0 && (
           <>
             <h3 className="mt-4 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Vitals</h3>
             <div className="mt-2 grid grid-cols-3 gap-2">
-              {vitalRows.map(([label, val, unit, b]) => (
-                <div key={label} className={`rounded-lg border px-2.5 py-2 ${b ? bandClasses[b] : bandClasses.null}`}>
-                  <div className="text-[10px] font-medium opacity-70">{label}</div>
-                  <div className="text-base font-semibold tabular-nums">{val}<span className="ml-0.5 text-[10px] font-normal opacity-60">{unit}</span></div>
+              {vitalRows.map(({ vital, value, band }) => (
+                <div key={vital.key} className={`rounded-lg border px-2.5 py-2 ${band ? bandClasses[band] : bandClasses.null}`}>
+                  <div className="text-[10px] font-medium opacity-70">{vital.label}</div>
+                  <div className="text-base font-semibold tabular-nums">{value}<span className="ml-0.5 text-[10px] font-normal opacity-60">{vital.unit}</span></div>
                 </div>
               ))}
             </div>
